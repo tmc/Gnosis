@@ -1,5 +1,11 @@
 # Gnosis: Self-Awareness Mechanism for LLM Correctness Detection
 
+<div align="center"> <img src="assets/Gnosis_demo.gif" alt="Gnosis Demo" width="100%" />
+
+Overview of our Gnosis self-awareness mechanism and its performance.
+
+<img src="assets/main_fig.pdf" alt="Gnosis Overview Figure" width="100%" /> </div>
+
 **Gnosis** is a lightweight **self-awareness head** attached to a *(frozen)* LLM backbone that predicts a **scalar correctness probability** for a generated response by reading the model’s **hidden states + attention maps**.
 
 ---
