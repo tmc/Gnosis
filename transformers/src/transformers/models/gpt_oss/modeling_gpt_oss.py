@@ -33,7 +33,7 @@ from ...modeling_layers import (
     GenericForTokenClassification,
     GradientCheckpointingLayer,
 )
-
+from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
@@ -41,43 +41,6 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_gpt_oss import GptOssConfig
-
-#selfaware**********************************************
-from dataclasses import dataclass
-import torch, torch.nn.functional as F
-from typing import List
-from .feature_extractors import (
-    AttnFeatureExtractorLite_D3,
-    HiddenFeatureExtractorLite,
-    ConfFeatureExtractorLite,
-    CorrectnessHeadLite
-)
-
-# from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast #original import
-from ...modeling_outputs import (
-    MoeCausalLMOutputWithPast as _BaseMoeCausalLMOutputWithPast,
-    MoeModelOutputWithPast as _BaseMoeModelOutputWithPast,
-)
-@dataclass
-class MoeCausalLMOutputWithPast(_BaseMoeCausalLMOutputWithPast):
-    # New field, e.g. shape [batch_size] or [batch_size, 1]
-    stop_prob: Optional[torch.FloatTensor] = None
-
-
-@dataclass
-class MoeModelOutputWithPast(_BaseMoeModelOutputWithPast):
-    # Only needed if you also want stop_prob on the base MoE model output
-    stop_prob: Optional[torch.FloatTensor] = None
-
-def _safe_dtype_param(module: nn.Module):
-    for p in module.parameters():
-        return p.dtype
-    return torch.bfloat16
-
-MoeCausalLMOutputWithPast.__doc__ = _BaseMoeCausalLMOutputWithPast.__doc__
-MoeModelOutputWithPast.__doc__ = _BaseMoeModelOutputWithPast.__doc__
-#********************************************************
-
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -650,213 +613,9 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
 
-        #selfaware*******************************************
-        # ---- feature toggles (simple booleans) ----
-        self.use_stop_attn = bool(getattr(config, "use_stop_attn", False))
-        self.use_stop_conf = bool(getattr(config, "use_stop_conf", False))
-        self.use_stop_hid  = bool(getattr(config, "use_stop_hid",  True))
-
-        # ---- dims (safe defaults) ----
-        D_ATT  = int(getattr(config, "stop_att_dim", 256))
-        D_CONF = int(getattr(config, "stop_conf_dim", 128))
-        D_HID  = int(getattr(config, "stop_hid_dim", 256))
-
-        k_conf = int(getattr(config, "stop_k_conf", 192))
-        k_hid  = int(getattr(config, "stop_k_hid", 192))
-
-        max_layers = int(getattr(config, "num_hidden_layers", 64))
-        max_heads  = int(getattr(config, "num_attention_heads", 64))
-
-
-        if self.use_stop_attn:
-            self.attn_extractor = AttnFeatureExtractorLite_D3(
-                D_ATT=D_ATT,
-                d_grid=192,
-                cnn_channels=(32, 64, 128),
-                grid_conv_layers=6,
-                K=8,
-                pdrop=0.10,
-                max_layers=max_layers,
-                max_heads=max_heads,
-                feature_mode="spectral",              # <-- CNN disabled & not initialized #basemodels
-                # feature_mode="both",              # <-- CNN disabled & not initialized #V2
-                stats_groups=("all",),             # <-- choose ablation set(s) below
-                spec_radii=(0.15, 0.35, 0.60),        # optional: spectral ring cutoffs
-                band_widths=(None, None),             # optional: (k//32, k//16) by default
-            )
-        else:
-            self.attn_extractor = None
-
-        if self.use_stop_conf:
-            self.conf_extractor = ConfFeatureExtractorLite(
-                D_CONF=D_CONF,
-                d_tok=128,          # token dim over time
-                k_conf=k_conf,      # downsampled time steps
-                base_c=64,          # channels in 1D conv stem
-                K=3,                # PMA seeds
-                sab_layers=2,
-                sab_heads=4,
-                pdrop=0.10,
-            )
-        else:
-            self.conf_extractor = None
-
-        if self.use_stop_hid:
-            #2.5m
-            self.hid_extractor = HiddenFeatureExtractorLite(
-                D_model=config.hidden_size,
-                D_HID=D_HID,
-                d_tok=192,          # token dim over time
-                k_hid=k_hid,        # downsampled time steps
-                groups=8,           # depthwise grouping for 1D convs
-                K=3,                # PMA seeds
-                sab_layers=3,
-                sab_heads=4,
-                pdrop=0.10,
-            )
-        else:
-            self.hid_extractor = None
-
-
-        # correctness head sized to the *enabled* features only
-        self.stop_head = CorrectnessHeadLite(
-            D_ATT=D_ATT, D_CONF=D_CONF, D_HID=D_HID, pdrop=0.10,
-            use_attn=self.use_stop_attn, use_conf=self.use_stop_conf, use_hid=self.use_stop_hid,
-        )
-
-        # thresholds (optional)
-        self.stop_threshold   = 0.5
-
-        # expose for init/freeze utilities (only the ones that exist)
-        self._custom_head_names = []
-        if self.attn_extractor is not None: self._custom_head_names.append("attn_extractor")
-        if self.conf_extractor is not None: self._custom_head_names.append("conf_extractor")
-        if self.hid_extractor  is not None: self._custom_head_names.append("hid_extractor")
-        self._custom_head_names.append("stop_head")
-
         # Initialize weights and apply final processing
         self.post_init()
 
-        # freeze base; train only aux modules that exist
-        trainable_prefixes = tuple(self._custom_head_names)
-        for n, p in self.named_parameters():
-            if n.startswith(trainable_prefixes):
-                p.requires_grad_(True)
-            else:
-                p.requires_grad_(False)
-        #****************************************************
-    
-    #selfaware*******************************************************************************************
-    # # ----------------------------------------------------------------------------------
-    # # Aux correctness scorer (returns sequence-level probability; shape (B,1))
-    # # ----------------------------------------------------------------------------------
-    def _should_stop(
-        self,
-        last_hidden: torch.Tensor,                 # (B,S,Hd)
-        attn_stack: Optional[List[torch.Tensor]],  # length L: each is (B,H,k,k)  <-- already reduced
-        token_probs: torch.Tensor,                 # (B,S)
-    ) -> torch.Tensor:
-        """
-        Returns a single scalar probability per sequence: (B,1).
-        Assumes attention maps are already reduced to (B,L,H,k,k).
-        """
-        B, S, _ = last_hidden.shape
-        out_dtype = _safe_dtype_param(self.stop_head)
-
-        # sanitize inputs early
-        # token_probs_s = torch.clamp(torch.nan_to_num(token_probs, nan=1.0, posinf=1.0, neginf=1e-8), 1e-8, 1.0)
-        # last_hidden_s = torch.nan_to_num(last_hidden, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # validate attention stack only if attention feature is enabled
-        A = None
-        if self.use_stop_attn:
-            if attn_stack is None or len(attn_stack) == 0:
-                raise RuntimeError("use_stop_attn=True but no reduced attentions were provided.")
-            with torch.no_grad():
-                A = torch.stack(attn_stack, dim=1).detach()  # (B,L,H,k,k)
-                if A.dim() != 5 or A.shape[-1] != A.shape[-2]:
-                    raise RuntimeError(f"Expected reduced attn (B,L,H,k,k), got {tuple(A.shape)}")
-                A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
-
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
-            # build features ONLY for enabled extractors (no zero fill)
-            z_att = None
-            z_conf = None
-            z_hid = None
-
-            if self.use_stop_attn:
-                z_att = self.attn_extractor(A.to(_safe_dtype_param(self.attn_extractor)))
-
-            if self.use_stop_conf:
-                z_conf = self.conf_extractor(token_probs.to(_safe_dtype_param(self.conf_extractor)))
-
-            if self.use_stop_hid:
-                temp = last_hidden.to(_safe_dtype_param(self.hid_extractor))
-                # print(temp)
-                z_hid  = self.hid_extractor(temp)
-
-            # print(z_hid)
-            # sanitize produced features (if any)
-            if z_att  is not None: z_att  = torch.nan_to_num(z_att,  nan=0.0, posinf=0.0, neginf=0.0)
-            if z_conf is not None: z_conf = torch.nan_to_num(z_conf, nan=0.0, posinf=0.0, neginf=0.0)
-            if z_hid  is not None: z_hid  = torch.nan_to_num(z_hid,  nan=0.0, posinf=0.0, neginf=0.0)
-
-            logits = self.stop_head(
-                z_att.to(out_dtype)  if z_att  is not None else None,
-                z_conf.to(out_dtype) if z_conf is not None else None,
-                z_hid.to(out_dtype)  if z_hid  is not None else None,
-            )  # (B,1)
-        # print(logits)
-        # stable sigmoid in fp32, sanitize & clamp to (0,1)
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-        with torch.amp.autocast("cuda", enabled=False):
-            probs = torch.sigmoid(logits.to(torch.float32))  # (B,1)
-        probs = torch.clamp(torch.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0), 1e-6, 1.0 - 1e-6).to(out_dtype)
-        # return probs, z_att, z_conf, z_hid
-        return probs
-  
-
-    def compute_stop_loss(
-        self,
-        probs_seq: torch.Tensor,           # (B,1) or (B,)
-        correctness_label: torch.Tensor,  # (B,) or (B,1); supports -1 to skip
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        """
-        BCE on a single sequence-level probability per example.
-        - probs_seq: model's probability that the sequence is "correct" (0..1)
-        - correctness_label: float/long in {-1, 0, 1}; -1 rows are skipped
-        """
-        # Shape & dtype hygiene
-        if probs_seq.dim() == 2 and probs_seq.size(-1) == 1:
-            probs_seq = probs_seq.squeeze(-1)                # (B,)
-        probs = torch.nan_to_num(probs_seq.float(), nan=0.5)
-        probs = probs.clamp(min=eps, max=1.0 - eps)
-
-        labels = correctness_label
-        if labels.dim() == 2 and labels.size(-1) == 1:
-            labels = labels.squeeze(-1)                      # (B,)
-        labels = torch.nan_to_num(labels.float(), nan=0.0)
-
-        # Skip rows with label == -1
-        keep = labels.ne(-1.0)
-        if not torch.any(keep):
-            # preserve graph
-            return probs.sum() * 0.0
-
-        y = labels[keep].clamp_(0.0, 1.0)
-        p = probs[keep]
-
-        loss = F.binary_cross_entropy(p, y, reduction="mean")
-        if not torch.isfinite(loss):
-            # ultra-conservative fallback to keep scaler alive
-            loss = probs.sum() * 0.0
-        return loss  
-    
-    #***************************************************************************************************
-   
-   
-   
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -871,7 +630,6 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         output_router_logits: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        correctness_label: Optional[torch.Tensor] = None,#selfaware
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
         r"""
@@ -902,54 +660,37 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        with torch.no_grad():
-            outputs: MoeModelOutputWithPast = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_router_logits=output_router_logits,
-                cache_position=cache_position,
-                **kwargs,
-            )
+        outputs: MoeModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_router_logits=output_router_logits,
+            cache_position=cache_position,
+            **kwargs,
+        )
 
-            hidden_states = outputs.last_hidden_state
-            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        hidden_states = outputs.last_hidden_state
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-
-        #selfaware**************************************
-        hidden_for_head = hidden_states[:, :-1, :].detach()
-        stop_prob = self._should_stop(
-            last_hidden = hidden_for_head,        # (B, S_hid, H)
-            attn_stack  = None,             # list[L] or None (already reduced by your backbone)
-            token_probs = None,       # (B, S_hid)  — neutral, since we removed token_probs_so_far
-        )  # (B,1)
-        # print(hidden_for_head)
-        # print(stop_prob)
-        # Only correctness loss (head-only training). BCE handles -1 rows internally.
-        loss = self.compute_stop_loss(stop_prob, correctness_label)
-
-
-
-
-        # loss = None
-        # if labels is not None:
-        #     loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
         aux_loss = None
-        # if output_router_logits:
-        #     aux_loss = load_balancing_loss_func(
-        #         outputs.router_logits,
-        #         self.num_experts,
-        #         self.num_experts_per_tok,
-        #         attention_mask,
-        #     )
-        #     if labels is not None:
-        #         loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
+        if output_router_logits:
+            aux_loss = load_balancing_loss_func(
+                outputs.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+                attention_mask,
+            )
+            if labels is not None:
+                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
         return MoeCausalLMOutputWithPast(
             loss=loss,
@@ -959,7 +700,6 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
-            stop_prob=stop_prob.detach(), #selfaware
         )
 
 
