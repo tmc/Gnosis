@@ -22,7 +22,7 @@ from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
-
+import math
 import datasets
 import torch
 import torch.utils.data
@@ -76,7 +76,7 @@ from .utils import (
     truncate_with_protected_tokens,
     unsplit_pixel_values_by_grid,
 )
-
+import torch, torch.nn.functional as F
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel
@@ -97,6 +97,37 @@ logger = logging.get_logger(__name__)
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+# def _trainable_correctness_param(name: str) -> bool:
+#     # Keep in sync with _skip_for_vllm()
+#     allow = ("stop_head", "axial_sent_encoder", "hid_encoder", "conf_encoder")
+#     return any(tok in name for tok in allow)
+
+def _trainable_correctness_param(name: str) -> bool:
+    # Keep in sync with _skip_for_vllm()
+    allow = ("stop_head", "attn_extractor", "hid_extractor", "conf_extractor")
+    return any(tok in name for tok in allow)
+
+def _freeze_except_stop_head(m: torch.nn.Module):
+    for n, p in m.named_parameters():
+        p.requires_grad = _trainable_correctness_param(n)
+
+# --- add these helpers somewhere in GRPOTrainer ---
+
+def scan_params(mod):
+    for n,p in mod.named_parameters():
+        if p is None: continue
+        if torch.isnan(p).any() or torch.isinf(p).any():
+            print(f"[BAD PARAM] .{n}")
+            # return True
+    for n,b in mod.named_buffers():
+        if b is None: continue
+        if torch.isnan(b).any() or torch.isinf(b).any():
+            print(f"[BAD BUFFER] .{n}")
+            # return True
+    # print(f"[OK] {tag}")
+    # return False
+
 
 
 class GRPOTrainer(Trainer):
@@ -244,6 +275,7 @@ class GRPOTrainer(Trainer):
             config = AutoConfig.from_pretrained(model_id)
             architecture = getattr(transformers, config.architectures[0])
             model = architecture.from_pretrained(model_id, **model_init_kwargs)
+
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -262,6 +294,20 @@ class GRPOTrainer(Trainer):
 
         if peft_config is not None or (is_peft_available() and isinstance(model, PeftModel)):
             model = prepare_peft_model(model, peft_config, args)
+
+        #myedit*****************
+        if args.enable_correctness_head and args.freeze_except_stop_head:
+            _freeze_except_stop_head(model)
+
+        bad = [n for n,p in model.named_parameters() if _trainable_correctness_param(n) and not p.requires_grad]
+        assert not bad, f"Correctness head accidentally frozen: {bad[:4]}..."
+
+        # Keep these handy for loss
+        self.lambda_stop = args.lambda_stop
+        self.correctness_last_k = args.correctness_last_k
+        self.enable_correctness_head = args.enable_correctness_head
+        #myedit*****************
+
 
         # Processing class
         if processing_class is None:
@@ -420,6 +466,7 @@ class GRPOTrainer(Trainer):
 
         # Reference model
         self.beta = args.beta
+        self.beta = 0
         if self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
@@ -604,6 +651,40 @@ class GRPOTrainer(Trainer):
                     self.reward_funcs[i] = self.accelerator.prepare_model(
                         reward_func, evaluation_mode=True, device_placement=True
                     )
+
+    def _skip_for_vllm(self, name: str) -> bool:
+        # Do not send custom correctness/stop-head modules to vLLM
+        custom_parts = (
+            "stop_head",
+            "axial_sent_encoder",
+            "hid_encoder",
+            "conf_encoder",
+            "_should_stop",
+            "correctness",
+            "stop_classifier",
+            "attn_extractor",
+            "conf_extractor",
+            "hid_extractor"
+
+        )
+        return any(p in name for p in custom_parts)
+
+    def _vllm_update_param(self, name: str, tensor: torch.Tensor):
+        """Send a single param to vLLM, skipping unknown/custom names."""
+        if self._skip_for_vllm(name):
+            return
+        try:
+            if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                self.vllm_client.update_named_param(name, tensor)
+            elif self.vllm_mode == "colocate":
+                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                llm_model.load_weights([(name, tensor)])
+        except ValueError as e:
+            # vLLM doesn't have this param/module → ignore silently
+            if "There is no module or parameter named" in str(e):
+                return
+            raise
+
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -881,6 +962,10 @@ class GRPOTrainer(Trainer):
                     elif self.vllm_mode == "colocate":
                         llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                         llm_model.load_weights([(full_name, param.data)])
+                    # Respect skip list and centralized error handling
+                    if self._skip_for_vllm(full_name):
+                        continue
+                    self._vllm_update_param(full_name, param.data)
 
     def _sync_fsdp2_params_to_vllm(self, module: nn.Module):
         # For FSDP2, module.state_dict() already covers all parameters, so no need for recursion
@@ -894,6 +979,11 @@ class GRPOTrainer(Trainer):
             elif self.vllm_mode == "colocate":
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights([(name, param)])
+            # Respect skip list and centralized error handling
+            if self._skip_for_vllm(full_name):
+                continue
+            self._vllm_update_param(full_name, param.data)
+
 
     @profiling_decorator
     def _move_model_to_vllm(self):
@@ -902,74 +992,60 @@ class GRPOTrainer(Trainer):
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
         if zero_stage_3:
             import deepspeed
-
             gather_if_zero3 = deepspeed.zero.GatheredParameters
         else:
             gather_if_zero3 = nullcontext
 
         if is_peft_model(self.model):
-            # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
-            # merging adapters in a sharded manner is not supported.
-            # TODO: does this work with FSDP?
+            # With PEFT and FSDP/ZeRO-3, merge adapters while params are gathered; then sync only base LM weights to vLLM.
             with gather_if_zero3(list(self.model.parameters())):
                 self.model.merge_adapter()
 
-                # Update vLLM weights while parameters are gathered
-                if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
-                    # Update vLLM weights while parameters are gathered
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
+                if self.is_fsdp_enabled:
+                    # FSDP path delegates to sync helpers (ensure those helpers also skip custom heads)
                     fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
                     fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
                     if fsdp_version == 1:
-                        self._sync_fsdp1_params_to_vllm(
-                            self.model
-                        )  # use memory-efficient post-order traversal for FSDP
+                        self._sync_fsdp1_params_to_vllm(self.model)
                     elif fsdp_version == 2:
                         self._sync_fsdp2_params_to_vllm(self.model)
                 else:
-                    # DeepSpeed ZeRO-3 with PEFT
+                    # ZeRO-3 (or plain) with PEFT: iterate named_parameters and push only compatible params
                     for name, param in self.model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name and discard some parameters
+                        # Recover original base names and drop PEFT wrappers
                         name = name.removeprefix("base_model.model.").replace(".base_layer", "")
                         if self.model.prefix in name:
                             continue
-                        # When module to save, remove its prefix and discard the original module
                         if "original_module" in name:
                             continue
                         name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                        self._vllm_update_param(name, param.data)
 
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
-                # Unmerge adapters while parameters are still gathered
+                # Unmerge adapters before exiting the gathered context
                 self.model.unmerge_adapter()
-                # Parameters will automatically be repartitioned when exiting the context
+
         else:
-            # For non-PEFT models, simply gather (if needed) and update each parameter individually.
+            # Non-PEFT models
             if self.is_fsdp_enabled:
                 fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
                 fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
                 if fsdp_version == 1:
-                    self._sync_fsdp1_params_to_vllm(self.model)  # use memory-efficient post-order traversal for FSDP
+                    self._sync_fsdp1_params_to_vllm(self.model)
                 elif fsdp_version == 2:
                     self._sync_fsdp2_params_to_vllm(self.model)
             else:
+                # Plain / ZeRO-3 without PEFT: iterate and push, filtering custom heads
                 for name, param in self.model.named_parameters():
                     name = self._fix_param_name_to_vllm(name)
                     with gather_if_zero3([param]):
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
+                        self._vllm_update_param(name, param.data)
 
         # Reset cache on vLLM
         if self.vllm_mode == "server" and self.accelerator.is_main_process:
             self.vllm_client.reset_prefix_cache()
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
+
 
     @profiling_decorator
     def _prepare_inputs(
@@ -1214,7 +1290,7 @@ class GRPOTrainer(Trainer):
                     "top_p": self.top_p,
                     "top_k": -1 if self.top_k is None else self.top_k,
                     "min_p": 0.0 if self.min_p is None else self.min_p,
-                    "max_tokens": self.max_completion_length,
+                    "max_tokens": self.max_completion_length - 1000,
                     "guided_decoding": guided_decoding,
                     "logprobs": 0,  # only return the logprob of the generated token
                 }
@@ -1268,8 +1344,88 @@ class GRPOTrainer(Trainer):
                     completion_ids = completion_ids[tp_slice]
                     all_logprobs = all_logprobs[tp_slice]
 
+            
+                # --- Optional Stage 2: ensure </think> (end_thinking_id) then continue 1000 tokens ---
+                # end_thinking_id = getattr(self, "end_thinking_id", None)
+                end_thinking_id = self.processing_class.convert_tokens_to_ids("</think>")
+                assert end_thinking_id is not None, "Set self.end_thinking_id to the tokenizer id for the end-of-thinking token."
+
+                # completion_ids are lists of ints at this point
+                needs_stage2 = []
+                for i, ids in enumerate(completion_ids):
+                    # Safe list-based check (no .any() on bools/lists)
+                    if not any(tok == end_thinking_id for tok in ids):
+                        needs_stage2.append(i)
+
+                if len(needs_stage2) > 0:
+                    with torch.no_grad():
+                        # unpadded prompt lengths
+                        prompt_lens = (prompt_ids != self.pad_token_id).sum(dim=1)
+
+                        stage2_inputs = []
+                        idx_map = []
+
+                        for i in needs_stage2:
+                            plen = int(prompt_lens[i].item())
+                            prompt_part = prompt_ids[i, :plen].detach().cpu().tolist()
+                            comp_part = completion_ids[i]  # this is already a list[int]
+
+                            full_seed = prompt_part + comp_part + [int(end_thinking_id)]
+
+                            if has_images:
+                                stage2_inputs.append({
+                                    "prompt_token_ids": full_seed,
+                                    "multi_modal_data": {"image": images[i]}  # reuse same image
+                                })
+                            else:
+                                stage2_inputs.append({"prompt_token_ids": full_seed})
+
+                            idx_map.append(i)
+
+                    gen2_kwargs = dict(generation_kwargs)
+                    gen2_kwargs["max_tokens"] = 1000
+                    sampling_params_stage2 = SamplingParams(**gen2_kwargs)
+
+                    with profiling_context(self, "vLLM.generate.stage2"):
+                        stage2_outputs = self.llm.generate(stage2_inputs, sampling_params=sampling_params_stage2, use_tqdm=False)
+
+                    # Collect stage-2 continuations
+                    stage2_completion_ids = [o.token_ids for outs in stage2_outputs for o in outs.outputs]
+                    stage2_logprobs = [
+                        [next(iter(lp.values())).logprob for lp in o.logprobs]
+                        for outs in stage2_outputs
+                        for o in outs.outputs
+                    ]
+
+                    # Merge back
+                    for k, local_i in enumerate(idx_map):
+                        # old completion (list[int]) -> tensor
+                        old_comp = torch.tensor(completion_ids[local_i], device=device, dtype=prompt_ids.dtype)
+                        # inserted token (forced, no logprob)
+                        inserted_tok = torch.tensor([end_thinking_id], device=device, dtype=prompt_ids.dtype)
+                        # new continuation
+                        extra_ids = torch.tensor(stage2_completion_ids[k], device=device, dtype=prompt_ids.dtype)
+
+                        # concat tensors
+                        merged = torch.cat([old_comp, inserted_tok, extra_ids], dim=0)
+                        completion_ids[local_i] = merged.tolist()  # keep as list until your later tensorization step
+
+                        # align logprobs (0.0 for the forced token)
+                        all_logprobs[local_i] = all_logprobs[local_i] + [0.0] + stage2_logprobs[k]
+
+                # --- proceed with your existing padding/concat ---
+                completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+                completion_ids = pad(completion_ids, padding_value=self.pad_token_id)
+                prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+                sampling_per_token_logps = [
+                    torch.tensor(lp, device=device, dtype=torch.float32) for lp in all_logprobs
+                ]
+                sampling_per_token_logps = pad(sampling_per_token_logps, padding_value=0.0)
+
                 if self.args.vllm_enable_sleep_mode:
                     self.llm.sleep(level=1)
+
+
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -1369,23 +1525,26 @@ class GRPOTrainer(Trainer):
             # old_per_token_logps to None.
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
-            generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    pixel_values=prompt_inputs.get("pixel_values"),
-                    image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                    pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                    image_sizes=prompt_inputs.get("image_sizes"),
-                )
-            else:
-                old_per_token_logps = None
+
+            #myedit******
+            old_per_token_logps = None
+            # generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+            # if self.args.gradient_accumulation_steps % generate_every != 0 or (
+            #     self.use_vllm and self.vllm_importance_sampling_correction
+            # ):
+            #     old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            #         self.model,
+            #         prompt_completion_ids,
+            #         attention_mask,
+            #         logits_to_keep,
+            #         batch_size,
+            #         pixel_values=prompt_inputs.get("pixel_values"),
+            #         image_grid_thw=prompt_inputs.get("image_grid_thw"),
+            #         pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+            #         image_sizes=prompt_inputs.get("image_sizes"),
+            #     )
+            # else:
+            #     old_per_token_logps = None
 
             # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
             if self.use_vllm and self.vllm_importance_sampling_correction:
@@ -1394,35 +1553,37 @@ class GRPOTrainer(Trainer):
                     importance_sampling_ratio, max=self.vllm_importance_sampling_cap
                 )
 
-            # Compute the per-token log probabilities for the reference model
-            if self.beta != 0.0:
-                if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.ref_model,
-                        prompt_completion_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size=batch_size,
-                        pixel_values=prompt_inputs.get("pixel_values"),
-                        image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                        pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                        image_sizes=prompt_inputs.get("image_sizes"),
-                    )
-                else:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            prompt_completion_ids,
-                            attention_mask,
-                            logits_to_keep,
-                            batch_size=batch_size,
-                            pixel_values=prompt_inputs.get("pixel_values"),
-                            image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                            pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                            image_sizes=prompt_inputs.get("image_sizes"),
-                        )
-            else:
-                ref_per_token_logps = None
+            #myedit:
+            ref_per_token_logps = None
+            # # Compute the per-token log probabilities for the reference model
+            # if self.beta != 0.0:
+            #     if self.ref_model is not None:
+            #         ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            #             self.ref_model,
+            #             prompt_completion_ids,
+            #             attention_mask,
+            #             logits_to_keep,
+            #             batch_size=batch_size,
+            #             pixel_values=prompt_inputs.get("pixel_values"),
+            #             image_grid_thw=prompt_inputs.get("image_grid_thw"),
+            #             pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+            #             image_sizes=prompt_inputs.get("image_sizes"),
+            #         )
+            #     else:
+            #         with self.accelerator.unwrap_model(self.model).disable_adapter():
+            #             ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            #                 self.model,
+            #                 prompt_completion_ids,
+            #                 attention_mask,
+            #                 logits_to_keep,
+            #                 batch_size=batch_size,
+            #                 pixel_values=prompt_inputs.get("pixel_values"),
+            #                 image_grid_thw=prompt_inputs.get("image_grid_thw"),
+            #                 pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+            #                 image_sizes=prompt_inputs.get("image_sizes"),
+            #             )
+            # else:
+            #     ref_per_token_logps = None
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -1472,6 +1633,9 @@ class GRPOTrainer(Trainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
+
+        #myedit*********
+        correctness_labels = rewards[process_slice].clamp(0.0, 1.0).to(torch.float32)
 
         # Log the metrics
         if mode == "train":
@@ -1554,6 +1718,11 @@ class GRPOTrainer(Trainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
+
+        #myedit***********
+        if self.enable_correctness_head:
+            output["correctness_labels"] = correctness_labels
+
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if self.use_vllm and self.vllm_importance_sampling_correction:
@@ -1569,6 +1738,491 @@ class GRPOTrainer(Trainer):
         if "image_sizes" in prompt_inputs:
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
+
+
+    @profiling_decorator
+    def _onepass_hidden_attn_logps(
+        self,
+        unwrapped_model,        # unwrapped base for the forward
+        input_ids,              # (B, P+C)
+        attention_mask,         # (B, P+C)
+        completion_len,         # C
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_attention_mask=None,
+        image_sizes=None,
+        *,
+        microbatch_splits: int | None = None,  # e.g., 2 or 3 to avoid OOM
+        with_grad: bool = False,               # set True only if you explicitly want base-LM grads
+    ):
+        """
+        Single (possibly microbatched) forward to get:
+        - hidden: (B, P+C-1, H)  (drop the final next-token row)
+        - attns:  list[L] of (B, heads, L, L) or None
+        - per_token_logps: (B, C) for the completion tokens
+        """
+
+        def _bslice(x, start, end):
+            if x is None:
+                return None
+            if isinstance(x, (list, tuple)):
+                return x[start:end]
+            return x[start:end]
+
+        def _slice_pixels_by_grid(thw, pix, start, end):
+            # For VLMs that flatten image patches; number of patch "tokens" per sample = prod(THW)
+            if thw is None or pix is None:
+                return _bslice(pix, start, end)
+            # thw: (B,3) or (B,k) with last dim factors; compute cumulative counts
+            start_pix = thw[:start].prod(-1).sum().item()
+            end_pix   = thw[:end].prod(-1).sum().item()
+            return pix[start_pix:end_pix]
+
+        # Pick the base module (handles PEFT)
+        base = unwrapped_model.base_model.model if is_peft_model(unwrapped_model) else unwrapped_model.model
+
+        # Output head (lm_head or get_output_embeddings)
+        head = getattr(unwrapped_model, "lm_head", None)
+        if head is None and hasattr(unwrapped_model, "get_output_embeddings"):
+            head = unwrapped_model.get_output_embeddings()
+        if head is None:
+            raise AttributeError("Cannot find output head (lm_head/get_output_embeddings) on the model.")
+
+        B = input_ids.size(0)
+        C = int(completion_len)
+        assert C > 0, "completion_len must be > 0"
+
+        wants_attn = "output_attentions" in self.model_kwarg_keys
+        splits = microbatch_splits if (microbatch_splits and microbatch_splits > 1 and B > 1) else 1
+        mb_size = math.ceil(B / splits)
+
+        hidden_chunks, logp_chunks = [], []
+        attn_accum = None
+
+        grad_ctx = nullcontext() if with_grad else torch.no_grad()
+        with grad_ctx:
+            for start in range(0, B, mb_size):
+                end = min(start + mb_size, B)
+
+                mb_inputs = {
+                    "input_ids": _bslice(input_ids, start, end),
+                    "attention_mask": _bslice(attention_mask, start, end),
+                    "use_cache": False,
+                }
+                if image_grid_thw is not None:
+                    mb_inputs["image_grid_thw"] = _bslice(image_grid_thw, start, end)
+                if pixel_values is not None:
+                    mb_inputs["pixel_values"] = _slice_pixels_by_grid(image_grid_thw, pixel_values, start, end)
+                if pixel_attention_mask is not None:
+                    mb_inputs["pixel_attention_mask"] = _bslice(pixel_attention_mask, start, end)
+                if image_sizes is not None:
+                    mb_inputs["image_sizes"] = _bslice(image_sizes, start, end)
+                if wants_attn:
+                    mb_inputs["output_attentions"] = True  #should activate for attn, amir
+
+                out = base(**mb_inputs)
+
+                # Drop final next-token row to align tokens↔logits
+                mb_hidden = out.last_hidden_state[:, :-1, :]              # (mb, L-1, H)
+
+                # Align to completion: last C rows of hidden predict the C completion tokens
+                h_slice   = mb_hidden[:, -C:, :]                           # (mb, C, H)
+                mb_logits = head(h_slice)                                  # (mb, C, V)
+
+                # Compute selective log-softmax in fp32 for stability
+                mb_targets = mb_inputs["input_ids"][:, -C:]                # (mb, C)
+                mb_logps   = selective_log_softmax(mb_logits.to(torch.float32), mb_targets)
+
+                hidden_chunks.append(mb_hidden)
+                logp_chunks.append(mb_logps)
+
+                if wants_attn and hasattr(out, "attentions") and out.attentions is not None:
+                    if attn_accum is None:
+                        attn_accum = [[] for _ in range(len(out.attentions))]
+                    for li, layer_attn in enumerate(out.attentions):
+                        attn_accum[li].append(layer_attn)
+
+        hidden = torch.cat(hidden_chunks, dim=0)         # (B, L-1, H)
+        per_token_logps = torch.cat(logp_chunks, dim=0)  # (B, C)
+
+        if wants_attn and attn_accum is not None:
+            attns = [torch.cat(layer_list, dim=0) for layer_list in attn_accum]
+        else:
+            attns = None
+
+        return hidden, attns, per_token_logps
+
+
+    # t3?
+    @profiling_decorator
+    def _compute_correctness_loss(self, model, inputs):
+        """
+        Computes correctness loss for the aux head when _should_stop returns (B,1) probs.
+
+        Stability notes:
+        - Sanitize per-token log-probs BEFORE exp() to avoid NaN -> NaN.
+        - Clamp all probabilities strictly inside (0,1) (no in-place ops).
+        - Handle 'all -1 labels' by returning a graph-attached zero loss.
+        - Compute BCE in fp32 for bf16 stability.
+        - Metrics gathering done on CPU, with careful guards.
+        """
+        device = self.accelerator.device
+
+        # ----- Unpack -----
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)          # (B, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)   # (B, P+C)
+
+        B, C = completion_ids.shape
+        assert C > 0, "completion length must be > 0"
+
+        # Train base LM or not
+        train_base = bool(getattr(self.args, "correctness_train_base", False))
+        fsdp_ctx = (
+            FSDP.summon_full_params(self.model_wrapped, recurse=False)
+            if (self.is_fsdp_enabled and not train_base)
+            else nullcontext()
+        )
+
+        # ----- One forward pass on unwrapped base -----
+        with (
+            unwrap_model_for_generation(
+                self.model_wrapped,
+                self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation
+            ) as unwrapped_model,
+            fsdp_ctx,
+        ):
+            hidden, attns, per_token_logps = self._onepass_hidden_attn_logps(
+                unwrapped_model=unwrapped_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                completion_len=C,
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                pixel_attention_mask=inputs.get("pixel_attention_mask"),
+                image_sizes=inputs.get("image_sizes"),
+                microbatch_splits=getattr(self.args, "correctness_microbatch_splits", 1),
+                with_grad=train_base,
+            )  # hidden: (B, P+C-1, H), per_token_logps: (B, C)
+
+        # ----- Robust per-token probabilities across [prompt|completion] -----
+        lp = per_token_logps.to(torch.float32)
+        # sanitize BEFORE exp to avoid propagating NaNs/infs
+        lp = torch.nan_to_num(lp, nan=-100.0, neginf=-100.0, posinf=0.0)
+        tok_p_comp = torch.clamp(lp.exp(), 1e-8, 1.0).to(per_token_logps.dtype)  # (B, C)
+
+        P = prompt_ids.size(1)
+        tok_p_prompt = torch.ones((B, P), device=device, dtype=tok_p_comp.dtype)
+        token_probs  = torch.cat([tok_p_prompt, tok_p_comp], dim=1)  # (B, P+C)
+
+        if getattr(self.args, "debug_scan_params", False):
+            scan_params(model)
+
+        # ----- Aux head forward → (B,1) probs (sanitized inside _should_stop, but double-check here) -----
+        S_hid = hidden.size(1)  # usually P+C-1
+        probs_seq = model._should_stop(
+            last_hidden=hidden,                              # (B, S_hid, H)
+            attn_stack=attns,                                # list[L] or None
+            token_probs=token_probs[:, :S_hid],              # (B, S_hid)
+            mask=attention_mask[:, :S_hid].float(),          # (B, S_hid)
+            input_ids=input_ids[:, :S_hid],
+        ).squeeze(1)  # (B,)
+
+        # Final defensive sanitize + clamp; keep out-of-place ops (no .clamp_)
+        probs_seq = torch.nan_to_num(probs_seq, nan=0.5, posinf=1.0, neginf=0.0)
+        probs_seq = torch.clamp(probs_seq, 1e-6, 1.0 - 1e-6)
+
+        # ----- Labels (allow -1 => skip those rows cleanly) -----
+        raw_labels = inputs.get("correctness_labels")
+        if raw_labels is None:
+            raise RuntimeError("correctness_labels is required when enable_correctness_head=True")
+        raw_labels = raw_labels.to(device)
+
+        keep = (raw_labels != -1)
+        if not torch.any(keep):
+            # Graph-attached zero; skip metrics for this step
+            return (probs_seq.sum().to(torch.float32) * 0.0)
+
+        probs_seq = probs_seq[keep]                                     # (B_keep,)
+        labels    = raw_labels[keep].to(dtype=probs_seq.dtype)          # (B_keep,)
+        labels    = torch.nan_to_num(labels, nan=0.0)
+        labels    = torch.clamp(labels, 0.0, 1.0)
+
+        # ----- BCE on probabilities (fp32) -----
+        bce_loss = F.binary_cross_entropy(
+            probs_seq.to(torch.float32), labels.to(torch.float32), reduction="mean"
+        )
+
+        # Guard against rare non-finite loss (keep scaler alive)
+        if not torch.isfinite(bce_loss):
+            bce_loss = torch.zeros((), device=probs_seq.device, dtype=torch.float32)
+
+        # ----- Metrics (CPU safe path) -----
+        with torch.no_grad():
+            preds   = (probs_seq >= 0.5).to(labels.dtype)
+            acc_val = (preds == labels.to(preds.dtype)).float().mean()
+
+            # let pending CUDA errors surface before CPU copy
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+            acc_cpu  = acc_val.detach().to("cpu")
+            loss_cpu = bce_loss.detach().to("cpu")
+
+            mode = "train" if model.training else "eval"
+            try:
+                self._metrics[mode]["correctness_acc"].append(
+                    self.accelerator.gather_for_metrics(acc_cpu).mean().item()
+                )
+                self._metrics[mode]["stop_loss"].append(
+                    self.accelerator.gather_for_metrics(loss_cpu).mean().item()
+                )
+            except Exception:
+                # Fallback if gather trips due to prior CUDA errors
+                self._metrics[mode]["correctness_acc"].append(acc_cpu.item())
+                self._metrics[mode]["stop_loss"].append(loss_cpu.item())
+
+        return bce_loss
+
+    #********************************************************************************************
+    #New version, No slicing the prompt and just keeping the completions
+    # @profiling_decorator
+    # def _onepass_hidden_attn_logps(
+    #     self,
+    #     unwrapped_model,        # unwrapped base for the forward
+    #     input_ids,              # (B, P+C)
+    #     attention_mask,         # (B, P+C)
+    #     completion_len,         # C  (kept for signature compatibility; not used for slicing)
+    #     pixel_values=None,
+    #     image_grid_thw=None,
+    #     pixel_attention_mask=None,
+    #     image_sizes=None,
+    #     *,
+    #     microbatch_splits: int | None = None,  # e.g., 2 or 3 to avoid OOM
+    #     with_grad: bool = False,               # set True only if you explicitly want base-LM grads
+    # ):
+    #     """
+    #     Single (possibly microbatched) forward to get:
+    #     - hidden: (B, S-1, H)   with S = P+C (drop the final next-token row)
+    #     - attns:  list[L] of (B, heads, S, S) or None (passed through as-is by the base)
+    #     - per_token_logps: (B, S-1)  log P(x_{t+1} | x_{<=t}) for ALL positions (prompt + completion)
+    #     """
+    #     def _bslice(x, start, end):
+    #         if x is None:
+    #             return None
+    #         if isinstance(x, (list, tuple)):
+    #             return x[start:end]
+    #         return x[start:end]
+
+    #     def _slice_pixels_by_grid(thw, pix, start, end):
+    #         # For VLMs that flatten image patches; number of patch "tokens" per sample = prod(THW)
+    #         if thw is None or pix is None:
+    #             return _bslice(pix, start, end)
+    #         # thw: (B,3) or (B,k) with last dim factors; compute cumulative counts
+    #         start_pix = thw[:start].prod(-1).sum().item()
+    #         end_pix   = thw[:end].prod(-1).sum().item()
+    #         return pix[start_pix:end_pix]
+
+    #     # Pick the base module (handles PEFT)
+    #     base = unwrapped_model.base_model.model if is_peft_model(unwrapped_model) else unwrapped_model.model
+
+    #     # Output head (lm_head or get_output_embeddings)
+    #     head = getattr(unwrapped_model, "lm_head", None)
+    #     if head is None and hasattr(unwrapped_model, "get_output_embeddings"):
+    #         head = unwrapped_model.get_output_embeddings()
+    #     if head is None:
+    #         raise AttributeError("Cannot find output head (lm_head/get_output_embeddings) on the model.")
+
+    #     B = input_ids.size(0)
+
+    #     wants_attn = "output_attentions" in self.model_kwarg_keys
+    #     splits = microbatch_splits if (microbatch_splits and microbatch_splits > 1 and B > 1) else 1
+    #     mb_size = math.ceil(B / splits)
+
+    #     hidden_chunks, logp_chunks = [], []
+    #     attn_accum = None
+
+    #     grad_ctx = nullcontext() if with_grad else torch.no_grad()
+    #     with grad_ctx:
+    #         for start in range(0, B, mb_size):
+    #             end = min(start + mb_size, B)
+
+    #             mb_inputs = {
+    #                 "input_ids": _bslice(input_ids, start, end),
+    #                 "attention_mask": _bslice(attention_mask, start, end),
+    #                 "use_cache": False,
+    #             }
+    #             if image_grid_thw is not None:
+    #                 mb_inputs["image_grid_thw"] = _bslice(image_grid_thw, start, end)
+    #             if pixel_values is not None:
+    #                 mb_inputs["pixel_values"] = _slice_pixels_by_grid(image_grid_thw, pixel_values, start, end)
+    #             if pixel_attention_mask is not None:
+    #                 mb_inputs["pixel_attention_mask"] = _bslice(pixel_attention_mask, start, end)
+    #             if image_sizes is not None:
+    #                 mb_inputs["image_sizes"] = _bslice(image_sizes, start, end)
+    #             if wants_attn:
+    #                 mb_inputs["output_attentions"] = True  # activate attentions
+
+    #             out = base(**mb_inputs)
+
+    #             # Drop final next-token row to align tokens↔logits
+    #             mb_hidden = out.last_hidden_state[:, :-1, :]               # (mb, S-1, H)
+
+    #             # Logits for ALL positions (prompt + completion)
+    #             mb_logits_all = head(mb_hidden)                             # (mb, S-1, V)
+
+    #             # Selective log-softmax in fp32 for stability for ALL next tokens
+    #             mb_targets_all = mb_inputs["input_ids"][:, 1:]              # (mb, S-1)
+    #             mb_logps_all   = selective_log_softmax(
+    #                 mb_logits_all.to(torch.float32), mb_targets_all
+    #             )                                                           # (mb, S-1)
+
+    #             hidden_chunks.append(mb_hidden)
+    #             logp_chunks.append(mb_logps_all)
+
+    #             if wants_attn and hasattr(out, "attentions") and out.attentions is not None:
+    #                 if attn_accum is None:
+    #                     attn_accum = [[] for _ in range(len(out.attentions))]
+    #                 for li, layer_attn in enumerate(out.attentions):
+    #                     attn_accum[li].append(layer_attn)
+
+    #     hidden = torch.cat(hidden_chunks, dim=0)         # (B, S-1, H)
+    #     per_token_logps = torch.cat(logp_chunks, dim=0)  # (B, S-1)
+
+    #     if wants_attn and attn_accum is not None:
+    #         attns = [torch.cat(layer_list, dim=0) for layer_list in attn_accum]
+    #     else:
+    #         attns = None
+
+    #     return hidden, attns, per_token_logps
+
+    # @profiling_decorator
+    # def _compute_correctness_loss(self, model, inputs):
+    #     """
+    #     Computes correctness loss for the aux head when _should_stop returns (B,1) probs.
+
+    #     Now uses ALL tokens (prompt + completion) to build token_probs; no P/C split,
+    #     no prompt neutralization. Features are passed to the stop head as-is.
+    #     """
+    #     device = self.accelerator.device
+
+    #     # ----- Unpack -----
+    #     prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+    #     completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+    #     input_ids = torch.cat([prompt_ids, completion_ids], dim=1)          # (B, S=P+C)
+    #     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)   # (B, S)
+
+    #     B, C = completion_ids.shape
+    #     assert C > 0, "completion length must be > 0"
+
+    #     # Train base LM or not
+    #     train_base = bool(getattr(self.args, "correctness_train_base", False))
+    #     fsdp_ctx = (
+    #         FSDP.summon_full_params(self.model_wrapped, recurse=False)
+    #         if (self.is_fsdp_enabled and not train_base)
+    #         else nullcontext()
+    #     )
+
+    #     # ----- One forward pass on unwrapped base -----
+    #     with (
+    #         unwrap_model_for_generation(
+    #             self.model_wrapped,
+    #             self.accelerator,
+    #             gather_deepspeed3_params=self.args.ds3_gather_for_generation
+    #         ) as unwrapped_model,
+    #         fsdp_ctx,
+    #     ):
+    #         hidden, attns, per_token_logps = self._onepass_hidden_attn_logps(
+    #             unwrapped_model=unwrapped_model,
+    #             input_ids=input_ids,
+    #             attention_mask=attention_mask,
+    #             completion_len=C,  # kept for signature compatibility; not used for slicing
+    #             pixel_values=inputs.get("pixel_values"),
+    #             image_grid_thw=inputs.get("image_grid_thw"),
+    #             pixel_attention_mask=inputs.get("pixel_attention_mask"),
+    #             image_sizes=inputs.get("image_sizes"),
+    #             microbatch_splits=getattr(self.args, "correctness_microbatch_splits", 1),
+    #             with_grad=train_base,
+    #         )  # hidden: (B, S-1, H), per_token_logps: (B, S-1)
+
+    #     # ----- Per-token probabilities over ALL positions (prompt + completion) -----
+    #     lp = per_token_logps.to(torch.float32)
+    #     lp = torch.nan_to_num(lp, nan=-100.0, neginf=-100.0, posinf=0.0)       # sanitize BEFORE exp
+    #     token_probs = torch.clamp(lp.exp(), 1e-8, 1.0).to(per_token_logps.dtype)  # (B, S-1)
+
+    #     if getattr(self.args, "debug_scan_params", False):
+    #         scan_params(model)
+
+    #     # ----- Aux head forward → (B,1) probs (no extra processing) -----
+    #     S_hid = hidden.size(1)  # should be S-1
+    #     probs_seq = model._should_stop(
+    #         last_hidden=hidden,                         # (B, S-1, H)
+    #         attn_stack=attns,                           # list[L] or None
+    #         token_probs=token_probs[:, :S_hid],         # (B, S-1)
+    #         mask=attention_mask[:, :S_hid].float(),     # (B, S-1)
+    #         input_ids=input_ids[:, :S_hid],
+    #     ).squeeze(1)  # (B,)
+
+    #     # Final defensive sanitize + clamp; keep out-of-place ops (no .clamp_)
+    #     probs_seq = torch.nan_to_num(probs_seq, nan=0.5, posinf=1.0, neginf=0.0)
+    #     probs_seq = torch.clamp(probs_seq, 1e-6, 1.0 - 1e-6)
+
+    #     # ----- Labels (allow -1 => skip those rows cleanly) -----
+    #     raw_labels = inputs.get("correctness_labels")
+    #     if raw_labels is None:
+    #         raise RuntimeError("correctness_labels is required when enable_correctness_head=True")
+    #     raw_labels = raw_labels.to(device)
+
+    #     keep = (raw_labels != -1)
+    #     if not torch.any(keep):
+    #         # Graph-attached zero; skip metrics for this step
+    #         return (probs_seq.sum().to(torch.float32) * 0.0)
+
+    #     probs_seq = probs_seq[keep]                                     # (B_keep,)
+    #     labels    = raw_labels[keep].to(dtype=probs_seq.dtype)          # (B_keep,)
+    #     labels    = torch.nan_to_num(labels, nan=0.0)
+    #     labels    = torch.clamp(labels, 0.0, 1.0)
+
+    #     # ----- BCE on probabilities (fp32) -----
+    #     bce_loss = F.binary_cross_entropy(
+    #         probs_seq.to(torch.float32), labels.to(torch.float32), reduction="mean"
+    #     )
+    #     if not torch.isfinite(bce_loss):
+    #         bce_loss = torch.zeros((), device=probs_seq.device, dtype=torch.float32)
+
+    #     # ----- Metrics (CPU safe path) -----
+    #     with torch.no_grad():
+    #         preds   = (probs_seq >= 0.5).to(labels.dtype)
+    #         acc_val = (preds == labels.to(preds.dtype)).float().mean()
+
+    #         try:
+    #             torch.cuda.synchronize()
+    #         except Exception:
+    #             pass
+
+    #         acc_cpu  = acc_val.detach().to("cpu")
+    #         loss_cpu = bce_loss.detach().to("cpu")
+
+    #         mode = "train" if model.training else "eval"
+    #         try:
+    #             self._metrics[mode]["correctness_acc"].append(
+    #                 self.accelerator.gather_for_metrics(acc_cpu).mean().item()
+    #             )
+    #             self._metrics[mode]["stop_loss"].append(
+    #                 self.accelerator.gather_for_metrics(loss_cpu).mean().item()
+    #             )
+    #         except Exception:
+    #             self._metrics[mode]["correctness_acc"].append(acc_cpu.item())
+    #             self._metrics[mode]["stop_loss"].append(loss_cpu.item())
+
+    #     return bce_loss
+
+    #********************************************************************************************
+
 
     def compute_liger_loss(self, unwrapped_model, inputs):
         # Compute the per-token log probabilities for the model
@@ -1616,12 +2270,17 @@ class GRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
+
+        # NEW: correctness head path takes precedence and bypasses Liger/PPO
+        if getattr(self, "enable_correctness_head", False):
+            return self._compute_correctness_loss(model, inputs)
+
         if self.use_liger_loss:
-            # Compute the loss using the liger grpo loss
             unwrapped_model = self.accelerator.unwrap_model(model)
             return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
         else:
             return self._compute_loss(model, inputs)
+
 
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
