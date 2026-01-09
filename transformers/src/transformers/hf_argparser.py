@@ -248,22 +248,73 @@ class HfArgumentParser(ArgumentParser):
                 **bool_kwargs,
             )
 
+    # def _add_dataclass_arguments(self, dtype: DataClassType):
+    #     if hasattr(dtype, "_argument_group_name"):
+    #         parser = self.add_argument_group(dtype._argument_group_name)
+    #     else:
+    #         parser = self
+
+    #     try:
+    #         type_hints: dict[str, type] = get_type_hints(dtype)
+    #     except NameError:
+    #         raise RuntimeError(
+    #             f"Type resolution failed for {dtype}. Try declaring the class in global scope or "
+    #             "removing line of `from __future__ import annotations` which opts in Postponed "
+    #             "Evaluation of Annotations (PEP 563)"
+    #         )
+    #     except TypeError as ex:
+    #         # Remove this block when we drop Python 3.9 support
+    #         if sys.version_info[:2] < (3, 10) and "unsupported operand type(s) for |" in str(ex):
+    #             python_version = ".".join(map(str, sys.version_info[:3]))
+    #             raise RuntimeError(
+    #                 f"Type resolution failed for {dtype} on Python {python_version}. Try removing "
+    #                 "line of `from __future__ import annotations` which opts in union types as "
+    #                 "`X | Y` (PEP 604) via Postponed Evaluation of Annotations (PEP 563). To "
+    #                 "support Python versions that lower than 3.10, you need to use "
+    #                 "`typing.Union[X, Y]` instead of `X | Y` and `typing.Optional[X]` instead of "
+    #                 "`X | None`."
+    #             ) from ex
+    #         raise
+
+    #     for field in dataclasses.fields(dtype):
+    #         if not field.init:
+    #             continue
+    #         field.type = type_hints[field.name]
+    #         self._parse_dataclass_field(parser, field)
+
     def _add_dataclass_arguments(self, dtype: DataClassType):
         if hasattr(dtype, "_argument_group_name"):
             parser = self.add_argument_group(dtype._argument_group_name)
         else:
             parser = self
 
+        # Use the dataclass module's globals for forward-ref evaluation
+        mod = sys.modules.get(dtype.__module__)
+        globalns = {} if mod is None else mod.__dict__
+
         try:
-            type_hints: dict[str, type] = get_type_hints(dtype)
-        except NameError:
-            raise RuntimeError(
-                f"Type resolution failed for {dtype}. Try declaring the class in global scope or "
-                "removing line of `from __future__ import annotations` which opts in Postponed "
-                "Evaluation of Annotations (PEP 563)"
+            # Primary attempt: resolve all annotations normally
+            type_hints: dict[str, type] = get_type_hints(dtype, globalns=globalns, localns=globalns)
+        except NameError as ex:
+            # Fallback: resolve per-field; unknown names → Any (warn instead of crashing)
+            warnings.warn(
+                f"[HfArgumentParser] Could not fully resolve type annotations for "
+                f"{dtype.__module__}.{dtype.__qualname__}: {ex}. "
+                "Falling back to 'typing.Any' for unresolved types.",
+                RuntimeWarning,
             )
+            type_hints = {}
+            ann = getattr(dtype, "__annotations__", {}) or {}
+            for name, hint in ann.items():
+                try:
+                    if isinstance(hint, str):
+                        type_hints[name] = eval(hint, globalns, globalns)
+                    else:
+                        type_hints[name] = hint
+                except Exception:
+                    type_hints[name] = Any
         except TypeError as ex:
-            # Remove this block when we drop Python 3.9 support
+            # Keep legacy message for union-operator issues on <3.10
             if sys.version_info[:2] < (3, 10) and "unsupported operand type(s) for |" in str(ex):
                 python_version = ".".join(map(str, sys.version_info[:3]))
                 raise RuntimeError(
@@ -276,10 +327,11 @@ class HfArgumentParser(ArgumentParser):
                 ) from ex
             raise
 
+        # Apply resolved (or fallback) types and proceed
         for field in dataclasses.fields(dtype):
             if not field.init:
                 continue
-            field.type = type_hints[field.name]
+            field.type = type_hints.get(field.name, Any)
             self._parse_dataclass_field(parser, field)
 
     def parse_args_into_dataclasses(
